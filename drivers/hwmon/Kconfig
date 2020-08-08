@@ -710,7 +710,12 @@ config SENSORS_IT87
 	  IT8718F, IT8720F, IT8721F, IT8726F, IT8728F, IT8732F, IT8758E,
 	  IT8771E, IT8772E, IT8781F, IT8782F, IT8783E/F, IT8786E, IT8790E,
 	  IT8603E, IT8620E, IT8623E, and IT8628E sensor chips, and the SiS950
-	  clone.
+	  clone. Additionally, support is provided for ITE IT8606E, IT8607E, IT8613E,
+	  IT8625E, IT8655E, IT8665E, IT8686E, IT8736F, and IT8738E.
+
+	  It is likely that you will need to either append 'acpi_enforce_resources=lax'
+	  to the kernel command line or set the 'ignore_resource_conflict' module
+	  parameter to get this to work.
 
 	  This driver can also be built as a module. If so, the module
 	  will be called it87.
