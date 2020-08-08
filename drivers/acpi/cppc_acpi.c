@@ -56,7 +56,7 @@ struct cppc_pcc_data {
 	/*
 	 * Lock to provide controlled access to the PCC channel.
 	 *
-	 * For performance critical usecases(currently cppc_set_perf)
+	 * For performance-critical usecases(currently cppc_set_reg)
 	 *	We need to take read_lock and check if channel belongs to OSPM
 	 * before reading or writing to PCC subspace
 	 *	We need to take write_lock before transferring the channel
@@ -111,6 +111,14 @@ static DEFINE_PER_CPU(struct cpc_desc *, cpc_desc_ptr);
 #define CPC_SUPPORTED(cpc) ((cpc)->type == ACPI_TYPE_INTEGER ?		\
 				!!(cpc)->cpc_entry.int_value :		\
 				!IS_NULL_REG(&(cpc)->cpc_entry.reg))
+
+/*
+ * Evaluates to True if an optional cpc field is supported and is
+ * BUFFER only
+ */
+#define CPC_SUP_BUFFER_ONLY(cpc) ((cpc)->type == ACPI_TYPE_BUFFER &&	\
+				  !IS_NULL_REG(&(cpc)->cpc_entry.reg))
+
 /*
  * Arbitrary Retries in case the remote processor is slow to respond
  * to PCC commands. Keeping it high enough to cover emulators where
@@ -175,22 +183,8 @@ static ssize_t show_feedback_ctrs(struct kobject *kobj,
 }
 define_one_cppc_ro(feedback_ctrs);
 
-static struct attribute *cppc_attrs[] = {
-	&feedback_ctrs.attr,
-	&reference_perf.attr,
-	&wraparound_time.attr,
-	&highest_perf.attr,
-	&lowest_perf.attr,
-	&lowest_nonlinear_perf.attr,
-	&nominal_perf.attr,
-	&nominal_freq.attr,
-	&lowest_freq.attr,
-	NULL
-};
-
 static struct kobj_type cppc_ktype = {
 	.sysfs_ops = &kobj_sysfs_ops,
-	.default_attrs = cppc_attrs,
 };
 
 static int check_pcc_chan(int pcc_ss_id, bool chk_err_bit)
@@ -688,6 +682,89 @@ static bool is_cppc_supported(int revision, int num_ent)
  *	}
  */
 
+static bool is_buf_only(int reg_idx)
+{
+	switch (reg_idx) {
+	case HIGHEST_PERF:
+	case NOMINAL_PERF:
+	case LOW_NON_LINEAR_PERF:
+	case LOWEST_PERF:
+	case CTR_WRAP_TIME:
+	case AUTO_SEL_ENABLE:
+	case REFERENCE_PERF:
+		return false;
+	default:
+		return true;
+	}
+}
+
+#define REG_SUPPORTED(cpc, idx) (is_buf_only(idx) ?			    \
+				 CPC_SUP_BUFFER_ONLY(&cpc->cpc_regs[idx]) : \
+				 CPC_SUPPORTED(&cpc->cpc_regs[idx]))
+
+static int is_mandatory_reg(int reg_idx)
+{
+	switch (reg_idx) {
+	case HIGHEST_PERF:
+	case NOMINAL_PERF:
+	case LOW_NON_LINEAR_PERF:
+	case LOWEST_PERF:
+	case REFERENCE_CTR:
+	case DELIVERED_CTR:
+		return 1;
+	}
+
+	return 0;
+}
+
+#define MANDATORY_REG_CNT	6
+
+static int set_cppc_attrs(struct cpc_desc *cpc, int entries)
+{
+	int i, attr_i = 0, opt_reg_cnt;
+	static struct attribute **cppc_attrs;
+
+	cppc_attrs = kcalloc(entries, sizeof(*cppc_attrs), GFP_KERNEL);
+	if (!cppc_attrs)
+		return -ENOMEM;
+
+	/* Set optional regs */
+	opt_reg_cnt = entries - MANDATORY_REG_CNT;
+	for (i = 0; i < MAX_CPC_REG_ENT && attr_i < opt_reg_cnt; i++) {
+		if (is_mandatory_reg(i) || !REG_SUPPORTED(cpc, i))
+			continue;
+
+		switch (i) {
+		case NOMINAL_FREQ:
+			cppc_attrs[attr_i++] = &nominal_freq.attr;
+			break;
+		case LOWEST_FREQ:
+			cppc_attrs[attr_i++] = &lowest_freq.attr;
+			break;
+		case REFERENCE_PERF:
+			cppc_attrs[attr_i++] = &reference_perf.attr;
+			break;
+		case CTR_WRAP_TIME:
+			cppc_attrs[attr_i++] = &wraparound_time.attr;
+			break;
+		}
+	}
+
+	/* Set mandatory regs */
+	cppc_attrs[attr_i++] = &highest_perf.attr;
+	cppc_attrs[attr_i++] = &nominal_perf.attr;
+	cppc_attrs[attr_i++] = &lowest_nonlinear_perf.attr;
+	cppc_attrs[attr_i++] = &lowest_perf.attr;
+
+	/* Set feedback_ctr sysfs entry */
+	cppc_attrs[attr_i] = &feedback_ctrs.attr;
+
+	/* Set kobj_type member */
+	cppc_ktype.default_attrs = cppc_attrs;
+
+	return 0;
+}
+
 /**
  * acpi_cppc_processor_probe - Search for per CPU _CPC objects.
  * @pr: Ptr to acpi_processor containing this CPU's logical ID.
@@ -842,6 +919,10 @@ int acpi_cppc_processor_probe(struct acpi_processor *pr)
 	/* Plug PSD data into this CPU's CPC descriptor. */
 	per_cpu(cpc_desc_ptr, pr->id) = cpc_ptr;
 
+	ret = set_cppc_attrs(cpc_ptr, num_ent - 2);
+	if (ret)
+		goto out_free;
+
 	ret = kobject_init_and_add(&cpc_ptr->kobj, &cppc_ktype, &cpu_dev->kobj,
 			"acpi_cppc");
 	if (ret) {
@@ -903,6 +984,7 @@ void acpi_cppc_processor_exit(struct acpi_processor *pr)
 			iounmap(addr);
 	}
 
+	kfree(cppc_ktype.default_attrs);
 	kobject_put(&cpc_ptr->kobj);
 	kfree(cpc_ptr);
 }
@@ -1242,26 +1324,53 @@ out_err:
 EXPORT_SYMBOL_GPL(cppc_get_perf_ctrs);
 
 /**
- * cppc_set_perf - Set a CPU's performance controls.
- * @cpu: CPU for which to set performance controls.
- * @perf_ctrls: ptr to cppc_perf_ctrls. See cppc_acpi.h
+ * cppc_set_reg - Set the CPUs control register.
+ * @cpu: CPU for which to set the register.
+ * @ctrls: ptr to cppc_ctrls. See cppc_acpi.h
+ * @reg_idx: Index of the register being accessed
  *
  * Return: 0 for success, -ERRNO otherwise.
  */
-int cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls)
+int cppc_set_reg(int cpu, struct cppc_ctrls *ctrls,
+		 enum cppc_regs reg_idx)
 {
 	struct cpc_desc *cpc_desc = per_cpu(cpc_desc_ptr, cpu);
-	struct cpc_register_resource *desired_reg;
 	int pcc_ss_id = per_cpu(cpu_pcc_subspace_idx, cpu);
 	struct cppc_pcc_data *pcc_ss_data = NULL;
+	struct cpc_register_resource *reg;
 	int ret = 0;
+	u32 value;
 
 	if (!cpc_desc) {
 		pr_debug("No CPC descriptor for CPU:%d\n", cpu);
 		return -ENODEV;
 	}
 
-	desired_reg = &cpc_desc->cpc_regs[DESIRED_PERF];
+	switch (reg_idx) {
+	case ENABLE:
+		value = ctrls->enable;
+		break;
+	case DESIRED_PERF:
+		value = ctrls->desired_perf;
+		break;
+	case MAX_PERF:
+		value = ctrls->max_perf;
+		break;
+	case MIN_PERF:
+		value = ctrls->min_perf;
+		break;
+	case ENERGY_PERF:
+		value = ctrls->energy_perf;
+		break;
+	case AUTO_SEL_ENABLE:
+		value = ctrls->auto_sel_enable;
+		break;
+	default:
+		pr_debug("CPC register index #%d not writeable\n", reg_idx);
+		return -EINVAL;
+	}
+
+	reg = &cpc_desc->cpc_regs[reg_idx];
 
 	/*
 	 * This is Phase-I where we want to write to CPC registers
@@ -1270,7 +1379,7 @@ int cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls)
 	 * Since read_lock can be acquired by multiple CPUs simultaneously we
 	 * achieve that goal here
 	 */
-	if (CPC_IN_PCC(desired_reg)) {
+	if (CPC_IN_PCC(reg)) {
 		if (pcc_ss_id < 0) {
 			pr_debug("Invalid pcc_ss_id\n");
 			return -ENODEV;
@@ -1293,18 +1402,15 @@ int cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls)
 		cpc_desc->write_cmd_status = 0;
 	}
 
-	/*
-	 * Skip writing MIN/MAX until Linux knows how to come up with
-	 * useful values.
-	 */
-	cpc_write(cpu, desired_reg, perf_ctrls->desired_perf);
+	if (CPC_SUPPORTED(reg))
+		cpc_write(cpu, reg, value);
 
-	if (CPC_IN_PCC(desired_reg))
+	if (CPC_IN_PCC(reg))
 		up_read(&pcc_ss_data->pcc_lock);	/* END Phase-I */
 	/*
 	 * This is Phase-II where we transfer the ownership of PCC to Platform
 	 *
-	 * Short Summary: Basically if we think of a group of cppc_set_perf
+	 * Short Summary: Basically if we think of a group of cppc_set_reg
 	 * requests that happened in short overlapping interval. The last CPU to
 	 * come out of Phase-I will enter Phase-II and ring the doorbell.
 	 *
@@ -1347,7 +1453,7 @@ int cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls)
 	 * case during a CMD_READ and if there are pending writes it delivers
 	 * the write command before servicing the read command
 	 */
-	if (CPC_IN_PCC(desired_reg)) {
+	if (CPC_IN_PCC(reg)) {
 		if (down_write_trylock(&pcc_ss_data->pcc_lock)) {/* BEGIN Phase-II */
 			/* Update only if there are pending write commands */
 			if (pcc_ss_data->pending_pcc_write_cmd)
@@ -1363,7 +1469,83 @@ int cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls)
 	}
 	return ret;
 }
-EXPORT_SYMBOL_GPL(cppc_set_perf);
+EXPORT_SYMBOL_GPL(cppc_set_reg);
+
+int cppc_get_ctrls(int cpu, struct cppc_ctrls *ctrls)
+{
+	struct cpc_desc *cpc_desc = per_cpu(cpc_desc_ptr, cpu);
+	struct cpc_register_resource *desired_reg, *max_reg, *min_reg;
+	struct cpc_register_resource *energy_reg, *auto_sel_enable_reg;
+	struct cpc_register_resource *enable_reg;
+	int pcc_ss_id = per_cpu(cpu_pcc_subspace_idx, cpu);
+	u64 desired, max, min, energy, auto_sel_enable, enable;
+	struct cppc_pcc_data *pcc_ss_data = NULL;
+	int ret = 0, regs_in_pcc = 0;
+
+	if (!cpc_desc) {
+		pr_debug("No CPC descriptor for CPU: %d\n", cpu);
+		return -ENODEV;
+	}
+
+	enable_reg = &cpc_desc->cpc_regs[ENABLE];
+	desired_reg = &cpc_desc->cpc_regs[DESIRED_PERF];
+	max_reg = &cpc_desc->cpc_regs[MAX_PERF];
+	min_reg = &cpc_desc->cpc_regs[MIN_PERF];
+	energy_reg = &cpc_desc->cpc_regs[ENERGY_PERF];
+	auto_sel_enable_reg = &cpc_desc->cpc_regs[AUTO_SEL_ENABLE];
+
+	/* Check if any of the perf registers are in PCC */
+	if (CPC_IN_PCC(desired_reg) || CPC_IN_PCC(max_reg) ||
+	    CPC_IN_PCC(min_reg) || CPC_IN_PCC(energy_reg) ||
+	    CPC_IN_PCC(auto_sel_enable_reg) || CPC_IN_PCC(enable_reg)) {
+		pcc_ss_data = pcc_data[pcc_ss_id];
+		down_write(&pcc_ss_data->pcc_lock);
+		regs_in_pcc = 1;
+
+		/*Ring doorbell once to update PCC subspace */
+		if (send_pcc_cmd(pcc_ss_id, CMD_READ) < 0) {
+			ret = -EIO;
+			goto out_err;
+		}
+	}
+
+	/* desired_perf is the only mandatory value in ctrls */
+	if (cpc_read(cpu, desired_reg, &desired))
+		ret = -EFAULT;
+
+	if (CPC_SUP_BUFFER_ONLY(enable_reg) &&
+	    cpc_read(cpu, enable_reg, &enable))
+		ret = -EFAULT;
+
+	if (CPC_SUP_BUFFER_ONLY(max_reg) && cpc_read(cpu, max_reg, &max))
+		ret = -EFAULT;
+
+	if (CPC_SUP_BUFFER_ONLY(min_reg) && cpc_read(cpu, min_reg, &min))
+		ret = -EFAULT;
+
+	if (CPC_SUP_BUFFER_ONLY(energy_reg) &&
+	    cpc_read(cpu, energy_reg, &energy))
+		ret = -EFAULT;
+
+	if (CPC_SUPPORTED(auto_sel_enable_reg) &&
+	    cpc_read(cpu, auto_sel_enable_reg, &auto_sel_enable))
+		ret = -EFAULT;
+
+	if (!ret) {
+		ctrls->enable = enable;
+		ctrls->desired_perf = desired;
+		ctrls->max_perf = max;
+		ctrls->min_perf = min;
+		ctrls->energy_perf = energy;
+		ctrls->auto_sel_enable = auto_sel_enable;
+	}
+
+out_err:
+	if (regs_in_pcc)
+		up_write(&pcc_ss_data->pcc_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cppc_get_ctrls);
 
 /**
  * cppc_get_transition_latency - returns frequency transition latency in ns
